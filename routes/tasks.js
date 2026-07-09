@@ -241,11 +241,14 @@ router.post('/:id/request-reopen', async (req, res) => {
     }
 
     // Vérifier si une demande de réouverture existe déjà pour cette tâche
-    let existingNotif = null;
-    // Fetch unread notifications for admins and check for existing REOPEN_REQUEST for this task
     const adminUnread = await getNotificationsForUser(null, true);
-    if (adminUnread.some(n => n.task === task._id && n.type === 'REOPEN_REQUEST' && n.isRead === false)) {
-      return res.status(400).json({ message: 'Une demande de réouverture est déjà en cours pour cette tâche.' })
+    const alreadyRequested = adminUnread.some(n =>
+      n.task?.toString() === task._id.toString() &&
+      n.type === 'REOPEN_REQUEST' &&
+      n.isRead === false
+    )
+    if (alreadyRequested) {
+      return res.status(409).json({ message: 'Une demande de réouverture a déjà été envoyée pour cette tâche.' })
     }
 
     // Ajouter un commentaire pour tracer la demande

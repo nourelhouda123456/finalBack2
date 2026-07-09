@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 
 dotenv.config();
+console.log("FIREBASE_SERVICE_ACCOUNT_PATH =", process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
 
 let isFirebaseConfigured = false;
 

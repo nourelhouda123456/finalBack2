@@ -1,4 +1,4 @@
-import express from 'express'
+ import express from 'express'
 import { protect } from '../middleware/auth.js'
 import Groq from 'groq-sdk'
 import Task from '../models/task.js'
@@ -84,17 +84,22 @@ async function buildProjectSummary(projectId, reqUser, { forSpeech = false } = {
   // ── Instructions de rédaction adaptées selon le canal ──
   // forSpeech = true  → phrases fluides, sans markdown, adapté à la lecture à voix haute (assistant vocal)
   // forSpeech = false → structuré avec titres **gras**, adapté à l'affichage dans le modal (bouton Résumé IA)
-  const writingInstructions = forSpeech
+const writingInstructions = forSpeech
     ? `Rédige un résumé d'avancement du projet en français, en phrases naturelles et fluides,
-adapté à une lecture à voix haute (pas de listes à puces, pas de symboles ** ou #, pas de titres).
+adapté à la fois à un affichage textuel et à une lecture à voix haute.
 Structure implicite: vue d'ensemble, points de vigilance, recommandation.
-Reste factuel, base-toi uniquement sur les données fournies, sois concis (100 mots max).`
+Pas de listes à puces, pas de titres, pas de symboles # ni de numérotation.
+Reste factuel, base-toi uniquement sur les données fournies, sois concis (100 mots max).
+
+Important - mise en forme des noms: chaque fois que tu mentionnes le nom d'une personne, entoure-le de doubles astérisques, par exemple **Ahmed**. N'utilise ce marquage ** que pour les noms de personnes, pas pour d'autres mots.`
     : `Rédige un résumé d'avancement du projet en français, structuré ainsi:
 1. Un paragraphe de synthèse générale (2-3 phrases)
 2. Points de vigilance / risques (retards, blocages, membres inactifs)
 3. Recommandation d'action concrète pour l'administrateur
 
-Reste factuel, base-toi uniquement sur les données fournies, sois concis (150 mots max). Ne recopie pas la liste de l'équipe (elle est déjà affichée séparément), concentre-toi sur l'analyse.`
+Reste factuel, base-toi uniquement sur les données fournies, sois concis (150 mots max). Ne recopie pas la liste de l'équipe (elle est déjà affichée séparément), concentre-toi sur l'analyse.
+
+Important - mise en forme des noms: chaque fois que tu mentionnes le nom d'une personne (membre de l'équipe, propriétaire, etc.) dans le texte, entoure-le de doubles astérisques, par exemple **Ahmed** ou **Sara Ben Ali**. N'utilise ce marquage ** que pour les noms de personnes, pas pour d'autres mots.`
 
   const dataStr = `
 Projet: ${project.name}
