@@ -1,4 +1,4 @@
- import express from 'express'
+import express from 'express'
 import { protect } from '../middleware/auth.js'
 import Groq from 'groq-sdk'
 import Task from '../models/task.js'
@@ -180,7 +180,23 @@ router.post('/execute', protect, async (req, res) => {
        users = await User.find({}).select('_id name')
     }
 
-    const tasks = await Task.find({ owner: req.user._id }).select('_id title')
+    // ── Tâches visibles par l'utilisateur ──
+    // IMPORTANT: on inclut les tâches DONT l'utilisateur est propriétaire OU
+    // assigné (pas seulement propriétaire), et toutes les tâches pour l'admin.
+    // Un contexte incomplet est la cause n°1 des mauvais mappings nom → ID
+    // par l'IA (elle "invente" ou réutilise un ID d'une autre tâche présente
+    // dans la liste quand la tâche demandée n'y figure pas, ce qui peut
+    // mener à la suppression ou modification d'une tâche complètement
+    // différente).
+    let tasks = []
+    if (req.user.role === 'admin') {
+      tasks = await Task.find({}).select('_id title')
+    } else {
+      tasks = await Task.find({
+        $or: [{ owner: req.user._id }, { assignee: req.user._id }]
+      }).select('_id title')
+    }
+    const knownTaskIds = new Set(tasks.map(t => t._id.toString()))
 
     const contextStr = `
 Contexte actuel:
@@ -197,6 +213,7 @@ Analyse la requête suivante: "${prompt}"
 Tu dois renvoyer STRICTEMENT un objet JSON valide correspondant à l'action.
 La valeur de "action" DOIT ÊTRE EXACTEMENT l'une des chaînes de caractères en anglais listées ci-dessous (ex: "add_comment", "create_task"). Ne la traduis pas.
 Si tu ne peux pas déduire l'action, renvoie {"action": "error", "message": "Raison"}.
+Si l'action concerne une tâche précise (delete_task, update_task, add_comment, approve_request, ignore_request) et qu'aucun ID de la liste "Tâches existantes" ne correspond clairement au titre mentionné, NE DEVINE PAS et NE RÉUTILISE PAS un autre ID de la liste : renvoie plutôt {"action": "error", "message": "Tâche introuvable, merci de préciser le titre exact."}.
 
 Correspondance des statuts : "bloqué" ou "bloquer" = "blocked", "en cours" = "in_progress", "terminé" = "done", "à faire" = "todo".
 Si l'utilisateur dit "bloquer la tâche X", l'action est "update_task" avec le status "blocked".
@@ -207,7 +224,7 @@ Structure JSON attendue (choisis UNE seule action parmi la liste suivante, et ut
 1. {"action": "create_task", "payload": {"title": "...", "description": "...", "project": "ID du projet (obligatoire)", "priority": "low|medium|high", "status": "todo|in_progress|blocked|done", "assignee": "ID (optionnel)", "visibility": "public|private"}}
 2. {"action": "update_task", "payload": {"taskId": "ID (obligatoire)", "title": "...", "description": "...", "priority": "low|medium|high", "status": "todo|in_progress|blocked|done", "assignee": "ID (optionnel)", "visibility": "public|private"}}
 3. {"action": "delete_task", "payload": {"taskId": "ID","title": "...","name": "..."}}
-4. {"action": "create_project", "payload": {"name": "...", "deadline": "YYYY-MM-DD", "description": "..."}} (Seulement si admin)
+4. {"action": "create_project", "payload": {"name": "...", "deadline": "YYYY-MM-DD", "description": "...", "assignedUsers": ["ID collaborateur 1", "ID collaborateur 2"]}} (Seulement si admin ; assignedUsers = IDs des collaborateurs mentionnés, déduits de la liste "Utilisateurs" du contexte, ne pas inclure l'admin lui-même, il est ajouté automatiquement)
 5. {"action": "update_project", "payload": {"projectId": "ID", "name": "...", "description": "...", "deadline": "YYYY-MM-DD"}} (Seulement si admin)
 6. {"action": "delete_project", "payload": {"projectId": "ID","name": "..."}} (Seulement si admin)
 7. {"action": "create_user", "payload": {"name": "...", "email": "...", "password": "...", "role": "user|admin"}} (Seulement si admin)
@@ -241,6 +258,21 @@ Associe les noms mentionnés dans la requête avec les IDs fournis dans le conte
        return res.status(400).json({ message: parsed.message || "L'IA n'a pas pu traiter la demande." })
     }
 
+    // ── Garde-fou anti-hallucination ──
+    // Même avec un contexte complet, on ne fait jamais confiance aveuglément
+    // à l'ID de tâche renvoyé par l'IA. S'il ne correspond à aucune tâche
+    // réellement listée dans le contexte transmis, on refuse d'agir plutôt
+    // que de risquer de modifier/supprimer une tâche au hasard.
+    const taskActions = ['delete_task', 'update_task', 'add_comment', 'approve_request', 'ignore_request']
+    if (taskActions.includes(parsed.action)) {
+      const taskId = parsed.payload?.taskId
+      if (!taskId || !knownTaskIds.has(taskId.toString())) {
+        return res.status(400).json({
+          message: "L'IA n'a pas pu identifier la tâche avec certitude. Merci de reformuler en précisant le titre exact de la tâche."
+        })
+      }
+    }
+
     // Execute the action
     const isAdmin = req.user.role === 'admin'
 
@@ -269,8 +301,18 @@ Associe les noms mentionnés dans la requête avec les IDs fournis dans le conte
        if (!task) return res.status(404).json({ message: 'Tâche introuvable.' })
        const isOwner = task.owner.toString() === req.user._id.toString()
        const isAssignee = task.assignee && task.assignee.toString() === req.user._id.toString()
-       if (!isAdmin && !isOwner && !isAssignee) return res.status(403).json({ message: 'Non autorisé.' })
-       
+
+       if (!isAdmin) {
+         // Un utilisateur ne peut supprimer que ses propres tâches (propriétaire ou assigné)
+         if (!isOwner && !isAssignee) {
+           return res.status(403).json({ message: 'Non autorisé : vous ne pouvez supprimer que vos propres tâches.' })
+         }
+         // Une tâche terminée ne peut être supprimée que par un administrateur
+         if (task.status === 'done') {
+           return res.status(403).json({ message: 'Seul un administrateur peut supprimer une tâche terminée.' })
+         }
+       }
+
        await task.deleteOne()
        return res.json({ message: "Tâche supprimée avec succès", action: "delete_task" })
     }
@@ -280,8 +322,23 @@ Associe les noms mentionnés dans la requête avec les IDs fournis dans le conte
        if (!task) return res.status(404).json({ message: 'Tâche introuvable.' })
        const isOwner = task.owner.toString() === req.user._id.toString()
        const isAssignee = task.assignee && task.assignee.toString() === req.user._id.toString()
-       if (!isAdmin && !isOwner && !isAssignee) return res.status(403).json({ message: 'Non autorisé.' })
-       
+
+       if (!isAdmin) {
+         // Un utilisateur ne peut modifier que ses propres tâches (propriétaire ou assigné)
+         if (!isOwner && !isAssignee) {
+           return res.status(403).json({ message: "Ce n'est pas votre tâche, vous ne pouvez pas la modifier." })
+         }
+         // Tâche terminée appartenant à quelqu'un d'autre (l'utilisateur n'est qu'assigné) :
+         // seul le propriétaire ou un administrateur peut y toucher.
+         if (!isOwner && task.status === 'done') {
+           return res.status(403).json({ message: "Cette tâche appartient à un autre utilisateur et est terminée : vous ne pouvez pas la modifier." })
+         }
+         // Une tâche terminée est verrouillée : seul un administrateur peut encore la modifier
+         if (task.status === 'done') {
+           return res.status(403).json({ message: 'Cette tâche est terminée : seul un administrateur peut la modifier. Vous pouvez demander une réouverture.' })
+         }
+       }
+
        if (parsed.payload.title) task.title = parsed.payload.title
        if (parsed.payload.status && parsed.payload.status !== task.status) {
           task.statusHistory.push({ previousStatus: task.status, newStatus: parsed.payload.status, changedBy: req.user._id })
@@ -301,7 +358,24 @@ Associe les noms mentionnés dans la requête avec les IDs fournis dans le conte
        if (!isAdmin) return res.status(403).json({ message: 'Seul un admin peut gérer les projets.' })
        
        if (parsed.action === 'create_project') {
-          const p = await Project.create({ name: parsed.payload.name, description: parsed.payload.description, owner: req.user._id, assignedUsers: [req.user._id] })
+          const { name, description, deadline, assignedUsers } = parsed.payload
+
+          // Toujours inclure l'admin créateur, puis fusionner les collaborateurs
+          // mentionnés (ex: "collaborateur ahmed et nour"), en filtrant les
+          // IDs invalides/inconnus et les doublons.
+          const validUserIds = new Set(users.map(u => u._id.toString()))
+          const collaboratorIds = Array.isArray(assignedUsers)
+            ? assignedUsers.filter(id => validUserIds.has(id?.toString()))
+            : []
+          const finalAssignedUsers = [...new Set([req.user._id.toString(), ...collaboratorIds])]
+
+          const p = await Project.create({
+            name,
+            description,
+            deadline: deadline ? new Date(deadline) : undefined,
+            owner: req.user._id,
+            assignedUsers: finalAssignedUsers,
+          })
           return res.status(201).json({ message: "Projet créé avec succès", data: p, action: "create_project" })
        } else if (parsed.action === 'delete_project') {
           await Project.findByIdAndDelete(parsed.payload.projectId)
